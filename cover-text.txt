@@ -1,0 +1,42 @@
+The following patch series adds snapshotting functionality to ouichefs.
+Users can save the state of the file system at any point in time and
+roll back the state to that moment at a later point.
+
+The patch set consists of the following patches:
+
+01. mkfs: Add snapshot bitmaps
+02. ouichefs: Add bitmaps and snapshot list to API
+03. snapshot: Add API prototypes and helpers
+04. file: Implement block-granularity snapshotting
+05. inode/file: Inode-granularity copy-on-write
+06. snapshot: Implement snapshot API
+07. sysfs: Add sysfs interface
+08. super: Snapshot bitmap and list syncing
+09. docs: Add documentation for snapshotting system
+
+This patch set was tested for stability, correctness, and adherence to
+coding guidelines of the linux kernel by our GitLab CI pipeline, running
+QEMU virtualisation for an x86-64 machine.
+
+The changes to the file system, including the superblock and new
+bitmaps, are designed in such a way that backwards-compatibility to
+older ouichefs images can be achieved.
+
+diffstat:
+ Makefile             |   2 +-
+ docs/snapshots.md    | 104 +++++++++++++
+ file.c               |  94 ++++++++++--
+ fs.c                 |  13 +-
+ inode.c              | 233 +++++++++++++++++++++++++++-
+ mkfs/mkfs-ouichefs.c | 121 +++++++++++++--
+ ouichefs.h           |  53 ++++++-
+ snapshot.c           | 420 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ snapshot.h           |  72 +++++++++
+ super.c              | 167 +++++++++++++++++++-
+ sysfs.c              | 257 +++++++++++++++++++++++++++++++
+ sysfs.h              |  13 ++
+ 12 files changed, 1505 insertions(+), 44 deletions(-)
+
+Co-authored-by: Celina Sophie Kalus <celina.kalus@rwth-aachen.de>
+Co-authored-by: Marco Schlicht <marco.schlicht@rwth-aachen.de>
+Co-authored-by: Karsten Weikamp <karsten.weikamp@rwth-aachen.de>
