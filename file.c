@@ -15,24 +15,25 @@
 
 #include "ouichefs.h"
 #include "bitmap.h"
+#include "snapshot.h"
 
 /*
  * Map the buffer_head passed in argument with the iblock-th block of the file
  * represented by inode. If the requested block is not allocated and create is
  * true, allocate a new block on disk and map it.
  */
-static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
-				   struct buffer_head *bh_result, int create)
+static __always_inline int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
+				   struct buffer_head *bh_result, int create, int write)
 {
 	struct super_block *sb = inode->i_sb;
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
 	struct ouichefs_file_index_block *index;
 	struct buffer_head *bh_index;
-	int ret = 0, bno;
+	int ret = 0, bno, old_bno = 0;
 
 	/* If block number exceeds filesize, fail */
-	if (iblock >= OUICHEFS_BLOCK_SIZE >> 2)
+	if (iblock >= OUICHEFS_FILE_MAX_SUBBLOCKS)
 		return -EFBIG;
 
 	/* Read index block from disk */
@@ -42,22 +43,63 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	index = (struct ouichefs_file_index_block *)bh_index->b_data;
 
 	/*
+	 * If we are trying to write and the block happens to be a snapshot,
+	 * we need to get a new block, even if one is already being referenced
+	 * in the index block.
+	 */
+	bno = index->blocks[iblock];
+
+	if (write && is_block_snapshot(sb, bno)) {
+		/*
+		 * There is already a block, but it is write-protected
+		 * due to being in a snapshot. We need a new block.
+		 */
+		old_bno = bno;
+		bno = 0;
+	}
+
+	/*
 	 * Check if iblock is already allocated. If not and create is true,
 	 * allocate it. Else, get the physical block number.
 	 */
-	if (index->blocks[iblock] == 0) {
-		if (!create) {
-			ret = 0;
-			goto brelse_index;
-		}
+	if (bno == 0 && create) {
 		bno = get_free_block(sbi);
 		if (!bno) {
 			ret = -ENOSPC;
 			goto brelse_index;
 		}
+
+		unset_block_snapshot_bit(sb, bno);
+
 		index->blocks[iblock] = bno;
-	} else {
-		bno = index->blocks[iblock];
+		mark_buffer_dirty(bh_index);
+		sync_dirty_buffer(bh_index);
+	}
+
+	if (old_bno != 0) {
+		/* we need to copy the contents from the snapshot block */
+		struct buffer_head *bh_old, *bh_new;
+
+		bh_old = sb_bread(sb, old_bno);
+		if (!bh_old) {
+			ret = -EIO;
+			goto brelse_index;
+		}
+
+		bh_new = sb_bread(sb, bno);
+		if (!bh_new) {
+			brelse(bh_old);
+			ret = -EIO;
+			goto brelse_index;
+		}
+
+		memcpy(bh_new->b_data, bh_old->b_data, OUICHEFS_BLOCK_SIZE);
+
+		mark_buffer_dirty(bh_new);
+		sync_dirty_buffer(bh_new);
+
+		brelse(bh_old);
+		brelse(bh_new);
 	}
 
 	/* Map the physical block to the given buffer_head */
@@ -68,6 +110,17 @@ brelse_index:
 
 	return ret;
 }
+static int ouichefs_file_get_block_write(struct inode *inode, sector_t iblock,
+				   struct buffer_head *bh_result, int create)
+{
+	return ouichefs_file_get_block(inode, iblock, bh_result, create, 1);
+}
+
+static int ouichefs_file_get_block_read(struct inode *inode, sector_t iblock,
+		struct buffer_head *bh_result, int create)
+{
+	return ouichefs_file_get_block(inode, iblock, bh_result, create, 0);
+}
 
 /*
  * Called by the page cache to read a page from the physical disk and map it in
@@ -75,7 +128,7 @@ brelse_index:
  */
 static void ouichefs_readahead(struct readahead_control *rac)
 {
-	mpage_readahead(rac, ouichefs_file_get_block);
+	mpage_readahead(rac, ouichefs_file_get_block_read);
 }
 
 /*
@@ -84,7 +137,7 @@ static void ouichefs_readahead(struct readahead_control *rac)
  */
 static int ouichefs_writepage(struct page *page, struct writeback_control *wbc)
 {
-	return block_write_full_page(page, ouichefs_file_get_block, wbc);
+	return block_write_full_page(page, ouichefs_file_get_block_write, wbc);
 }
 
 /*
@@ -114,7 +167,7 @@ static int ouichefs_write_begin(struct file *file,
 
 	/* prepare the write */
 	err = block_write_begin(mapping, pos, len, pagep,
-				ouichefs_file_get_block);
+				ouichefs_file_get_block_write);
 	/* if this failed, reclaim newly allocated blocks */
 	if (err < 0) {
 		pr_err("%s:%d: newly allocated blocks reclaim not implemented yet\n",
@@ -151,6 +204,7 @@ static int ouichefs_write_end(struct file *file, struct address_space *mapping,
 			inode->i_blocks++;
 		inode->i_mtime = inode->i_ctime = current_time(inode);
 		mark_inode_dirty(inode);
+		write_inode_now(inode, 1);
 
 		/* If file is smaller than before, free unused blocks */
 		if (nr_blocks_old > inode->i_blocks) {
@@ -178,6 +232,7 @@ static int ouichefs_write_end(struct file *file, struct address_space *mapping,
 				index->blocks[i] = 0;
 			}
 			mark_buffer_dirty(bh_index);
+			sync_dirty_buffer(bh_index);
 			brelse(bh_index);
 		}
 	}
@@ -212,7 +267,13 @@ static int ouichefs_open(struct inode *inode, struct file *file) {
 		index = (struct ouichefs_file_index_block *)bh_index->b_data;
 
 		for (iblock = 0; index->blocks[iblock] != 0; iblock++) {
-			put_block(sbi, index->blocks[iblock]);
+			uint32_t bno = index->blocks[iblock];
+
+			/* do not put blocks if they are snapshot blocks */
+			if (is_block_snapshot(sb, bno))
+				continue;
+
+			put_block(sbi, bno);
 			index->blocks[iblock] = 0;
 		}
 		inode->i_size = 0;
@@ -220,7 +281,7 @@ static int ouichefs_open(struct inode *inode, struct file *file) {
 
 		brelse(bh_index);
 	}
-	
+
 	return 0;
 }
 
