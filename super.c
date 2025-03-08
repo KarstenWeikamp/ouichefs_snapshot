@@ -101,6 +101,7 @@ static int sync_sb_info(struct super_block *sb, int wait)
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct ouichefs_sb_info *disk_sb;
 	struct buffer_head *bh;
+	int snap_id;
 
 	/* Flush superblock */
 	bh = sb_bread(sb, 0);
@@ -115,6 +116,21 @@ static int sync_sb_info(struct super_block *sb, int wait)
 	disk_sb->nr_bfree_blocks = sbi->nr_bfree_blocks;
 	disk_sb->nr_free_inodes = sbi->nr_free_inodes;
 	disk_sb->nr_free_blocks = sbi->nr_free_blocks;
+	disk_sb->latest_snapshot = sbi->latest_snapshot;
+
+	for (snap_id = 0; snap_id < OUICHEFS_MAX_SNAPSHOTS; snap_id++) {
+		disk_sb->snapshot_list[snap_id].id
+			= sbi->snapshot_list[snap_id].id;
+		disk_sb->snapshot_list[snap_id].bno
+			= sbi->snapshot_list[snap_id].bno;
+		disk_sb->snapshot_list[snap_id].parent_id
+			= sbi->snapshot_list[snap_id].parent_id;
+		disk_sb->snapshot_list[snap_id].timestamp
+			= sbi->snapshot_list[snap_id].timestamp;
+		memcpy(disk_sb->snapshot_list[snap_id].comment,
+		       sbi->snapshot_list[snap_id].comment,
+		       OUICHEFS_SNAPSHOT_COMMENT_LEN);
+	}
 
 	mark_buffer_dirty(bh);
 	if (wait)
@@ -151,6 +167,33 @@ static int sync_ifree(struct super_block *sb, int wait)
 	return 0;
 }
 
+static int sync_isnap(struct super_block *sb, int wait)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct buffer_head *bh;
+	int i, idx;
+
+	/* Flush snapshot inodes bitmask */
+	for (i = 0; i < sbi->nr_isnap_blocks; i++) {
+		idx = sbi->nr_istore_blocks + sbi->nr_ifree_blocks + i + 1;
+
+		bh = sb_bread(sb, idx);
+		if (!bh)
+			return -EIO;
+
+		memcpy(bh->b_data,
+		       (void *)sbi->isnap_bitmap + i * OUICHEFS_BLOCK_SIZE,
+		       OUICHEFS_BLOCK_SIZE);
+
+		mark_buffer_dirty(bh);
+		if (wait)
+			sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+
+	return 0;
+}
+
 static int sync_bfree(struct super_block *sb, int wait)
 {
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
@@ -159,7 +202,8 @@ static int sync_bfree(struct super_block *sb, int wait)
 
 	/* Flush free blocks bitmask */
 	for (i = 0; i < sbi->nr_bfree_blocks; i++) {
-		idx = sbi->nr_istore_blocks + sbi->nr_ifree_blocks + i + 1;
+		idx = sbi->nr_istore_blocks + sbi->nr_ifree_blocks +
+				sbi->nr_isnap_blocks + i + 1;
 
 		bh = sb_bread(sb, idx);
 		if (!bh)
@@ -178,13 +222,43 @@ static int sync_bfree(struct super_block *sb, int wait)
 	return 0;
 }
 
+static int sync_bsnap(struct super_block *sb, int wait)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct buffer_head *bh;
+	int i, idx;
+
+	/* Flush free blocks bitmask */
+	for (i = 0; i < sbi->nr_bsnap_blocks; i++) {
+		idx = sbi->nr_istore_blocks + sbi->nr_ifree_blocks +
+				sbi->nr_isnap_blocks + sbi->nr_bfree_blocks + i + 1;
+
+		bh = sb_bread(sb, idx);
+		if (!bh)
+			return -EIO;
+
+		memcpy(bh->b_data,
+		       (void *)sbi->bsnap_bitmap + i * OUICHEFS_BLOCK_SIZE,
+		       OUICHEFS_BLOCK_SIZE);
+
+		mark_buffer_dirty(bh);
+		if (wait)
+			sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+
+	return 0;
+}
+
 static void ouichefs_put_super(struct super_block *sb)
 {
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 
 	if (sbi) {
 		kfree(sbi->ifree_bitmap);
+		kfree(sbi->isnap_bitmap);
 		kfree(sbi->bfree_bitmap);
+		kfree(sbi->bsnap_bitmap);
 		kfree(sbi);
 	}
 }
@@ -199,7 +273,13 @@ static int ouichefs_sync_fs(struct super_block *sb, int wait)
 	ret = sync_ifree(sb, wait);
 	if (ret)
 		return ret;
+	ret = sync_isnap(sb, wait);
+	if (ret)
+		return ret;
 	ret = sync_bfree(sb, wait);
+	if (ret)
+		return ret;
+	ret = sync_bsnap(sb, wait);
 	if (ret)
 		return ret;
 
@@ -239,7 +319,7 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 	struct ouichefs_sb_info *csb = NULL;
 	struct ouichefs_sb_info *sbi = NULL;
 	struct inode *root_inode = NULL;
-	int ret = 0, i;
+	int ret = 0, i, block_offset, snap_id;
 
 	/* Init sb */
 	sb->s_magic = OUICHEFS_MAGIC;
@@ -274,6 +354,23 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->nr_bfree_blocks = csb->nr_bfree_blocks;
 	sbi->nr_free_inodes = csb->nr_free_inodes;
 	sbi->nr_free_blocks = csb->nr_free_blocks;
+	sbi->nr_isnap_blocks = csb->nr_isnap_blocks;
+	sbi->nr_bsnap_blocks = csb->nr_bsnap_blocks;
+
+	for (snap_id = 0; snap_id < OUICHEFS_MAX_SNAPSHOTS; snap_id++) {
+		sbi->snapshot_list[snap_id].id
+			= csb->snapshot_list[snap_id].id;
+		sbi->snapshot_list[snap_id].bno
+			= csb->snapshot_list[snap_id].bno;
+		sbi->snapshot_list[snap_id].parent_id
+			= csb->snapshot_list[snap_id].parent_id;
+		sbi->snapshot_list[snap_id].timestamp
+			= csb->snapshot_list[snap_id].timestamp;
+		memcpy(sbi->snapshot_list[snap_id].comment,
+		       csb->snapshot_list[snap_id].comment,
+		       OUICHEFS_SNAPSHOT_COMMENT_LEN);
+	}
+
 	sb->s_fs_info = sbi;
 
 	brelse(bh);
@@ -285,8 +382,9 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = -ENOMEM;
 		goto free_sbi;
 	}
+	block_offset = sbi->nr_istore_blocks + 1;
 	for (i = 0; i < sbi->nr_ifree_blocks; i++) {
-		int idx = sbi->nr_istore_blocks + i + 1;
+		int idx = block_offset + i;
 
 		bh = sb_bread(sb, idx);
 		if (!bh) {
@@ -300,15 +398,39 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		brelse(bh);
 	}
 
+	/* Alloc and copy isnap_bitmap */
+	sbi->isnap_bitmap =
+		kzalloc(sbi->nr_isnap_blocks * OUICHEFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!sbi->isnap_bitmap) {
+		ret = -ENOMEM;
+		goto free_ifree;
+	}
+	block_offset += sbi->nr_ifree_blocks;
+	for (i = 0; i < sbi->nr_isnap_blocks; i++) {
+		int idx = block_offset + i;
+
+		bh = sb_bread(sb, idx);
+		if (!bh) {
+			ret = -EIO;
+			goto free_isnap;
+		}
+
+		memcpy((void *)sbi->isnap_bitmap + i * OUICHEFS_BLOCK_SIZE,
+		       bh->b_data, OUICHEFS_BLOCK_SIZE);
+
+		brelse(bh);
+	}
+
 	/* Alloc and copy bfree_bitmap */
 	sbi->bfree_bitmap =
 		kzalloc(sbi->nr_bfree_blocks * OUICHEFS_BLOCK_SIZE, GFP_KERNEL);
 	if (!sbi->bfree_bitmap) {
 		ret = -ENOMEM;
-		goto free_ifree;
+		goto free_isnap;
 	}
+	block_offset += sbi->nr_isnap_blocks;
 	for (i = 0; i < sbi->nr_bfree_blocks; i++) {
-		int idx = sbi->nr_istore_blocks + sbi->nr_ifree_blocks + i + 1;
+		int idx = block_offset + i;
 
 		bh = sb_bread(sb, idx);
 		if (!bh) {
@@ -317,6 +439,29 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		}
 
 		memcpy((void *)sbi->bfree_bitmap + i * OUICHEFS_BLOCK_SIZE,
+		       bh->b_data, OUICHEFS_BLOCK_SIZE);
+
+		brelse(bh);
+	}
+
+	/* Alloc and copy bsnap_bitmap */
+	sbi->bsnap_bitmap =
+		kzalloc(sbi->nr_bsnap_blocks * OUICHEFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!sbi->bsnap_bitmap) {
+		ret = -ENOMEM;
+		goto free_bfree;
+	}
+	block_offset += sbi->nr_bfree_blocks;
+	for (i = 0; i < sbi->nr_bsnap_blocks; i++) {
+		int idx = block_offset + i;
+
+		bh = sb_bread(sb, idx);
+		if (!bh) {
+			ret = -EIO;
+			goto free_bsnap;
+		}
+
+		memcpy((void *)sbi->bsnap_bitmap + i * OUICHEFS_BLOCK_SIZE,
 		       bh->b_data, OUICHEFS_BLOCK_SIZE);
 
 		brelse(bh);
@@ -341,8 +486,12 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 
 iput:
 	iput(root_inode);
+free_bsnap:
+	kfree(sbi->bsnap_bitmap);
 free_bfree:
 	kfree(sbi->bfree_bitmap);
+free_isnap:
+	kfree(sbi->isnap_bitmap);
 free_ifree:
 	kfree(sbi->ifree_bitmap);
 free_sbi:
