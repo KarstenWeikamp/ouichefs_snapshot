@@ -14,9 +14,15 @@
 #define OUICHEFS_SB_BLOCK_NR 0
 
 #define OUICHEFS_BLOCK_SIZE (1 << 12) /* 4 KiB */
-#define OUICHEFS_MAX_FILESIZE (1 << 22) /* 4 MiB */
+#define OUICHEFS_FILE_MAX_SUBBLOCKS (OUICHEFS_BLOCK_SIZE >> 2) /* 1024 */
+#define OUICHEFS_MAX_FILESIZE \
+	(OUICHEFS_BLOCK_SIZE * OUICHEFS_FILE_MAX_SUBBLOCKS) /* 4 MiB */
 #define OUICHEFS_FILENAME_LEN 28
 #define OUICHEFS_MAX_SUBFILES 128
+
+#define OUICHEFS_MAX_SNAPSHOTS 64
+
+#define OUICHEFS_SNAPSHOT_COMMENT_LEN 8
 
 /*
  * ouiche_fs partition layout
@@ -28,7 +34,11 @@
  * +---------------+
  * | ifree bitmap  |  sb->nr_ifree_blocks blocks
  * +---------------+
+ * | isnap bitmap  |  sb->nr_isnap_blocks blocks
+ * +---------------+
  * | bfree bitmap  |  sb->nr_bfree_blocks blocks
+ * +---------------+
+ * | bsnap bitmap  |  sb->nr_bsnap_blocks blocks
  * +---------------+
  * |    data       |
  * |      blocks   |  rest of the blocks
@@ -60,6 +70,14 @@ struct ouichefs_inode_info {
 #define OUICHEFS_INODES_PER_BLOCK \
 	(OUICHEFS_BLOCK_SIZE / sizeof(struct ouichefs_inode))
 
+struct ouichefs_snapshot {
+	uint32_t id;
+	uint32_t parent_id;
+	uint64_t timestamp;
+	uint64_t bno;
+	char comment[OUICHEFS_SNAPSHOT_COMMENT_LEN];
+};
+
 struct ouichefs_sb_info {
 	uint32_t magic; /* Magic number */
 
@@ -73,13 +91,32 @@ struct ouichefs_sb_info {
 	uint32_t nr_free_inodes; /* Number of free inodes */
 	uint32_t nr_free_blocks; /* Number of free blocks */
 
+	uint32_t nr_isnap_blocks; /* Number of inode snapshot bitmap blocks */
+	uint32_t nr_bsnap_blocks; /* Number of block snapshot bitmap blocks */
+
+	uint32_t latest_snapshot; /* ID of the latest created or restored snapshot */
+
+	struct ouichefs_snapshot snapshot_list[OUICHEFS_MAX_SNAPSHOTS];
+
 	unsigned long *ifree_bitmap; /* In-memory free inodes bitmap */
+	unsigned long *isnap_bitmap; /* In-memory snapshot inodes bitmap */
 	unsigned long *bfree_bitmap; /* In-memory free blocks bitmap */
+	unsigned long *bsnap_bitmap; /* In-memory snapshot blocks bitmap */
 };
 
+static_assert(
+	offsetof(struct ouichefs_sb_info, ifree_bitmap) <= OUICHEFS_BLOCK_SIZE,
+	"Superblock size must not be bigger than one block."
+);
+
 struct ouichefs_file_index_block {
-	uint32_t blocks[OUICHEFS_BLOCK_SIZE >> 2];
+	uint32_t blocks[OUICHEFS_FILE_MAX_SUBBLOCKS];
 };
+
+static_assert(
+	sizeof(struct ouichefs_file_index_block) == OUICHEFS_BLOCK_SIZE,
+	"File index block size must be exactly one block."
+);
 
 struct ouichefs_dir_block {
 	struct ouichefs_file {
@@ -87,6 +124,11 @@ struct ouichefs_dir_block {
 		char filename[OUICHEFS_FILENAME_LEN];
 	} files[OUICHEFS_MAX_SUBFILES];
 };
+
+static_assert(
+	sizeof(struct ouichefs_dir_block) == OUICHEFS_BLOCK_SIZE,
+	"Directory index block size must be exactly one block."
+);
 
 /* superblock functions */
 int ouichefs_fill_super(struct super_block *sb, void *data, int silent);
