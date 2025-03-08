@@ -24,6 +24,12 @@
 
 #define OUICHEFS_SNAPSHOT_COMMENT_LEN 8
 
+#define OUICHEFS_INODE_STORE 1
+#define OUICHEFS_INODE_BLOCK(ino) \
+	((ino / OUICHEFS_INODES_PER_BLOCK) + OUICHEFS_INODE_STORE)
+#define OUICHEFS_INODE_SHIFT(ino) \
+	(ino % OUICHEFS_INODES_PER_BLOCK)
+
 /*
  * ouiche_fs partition layout
  *
@@ -64,6 +70,7 @@ struct ouichefs_inode {
 
 struct ouichefs_inode_info {
 	uint32_t index_block;
+	struct ouichefs_inode_info *parent;
 	struct inode vfs_inode;
 };
 
@@ -137,6 +144,9 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent);
 int ouichefs_init_inode_cache(void);
 void ouichefs_destroy_inode_cache(void);
 struct inode *ouichefs_iget(struct super_block *sb, unsigned long ino);
+int ouichefs_inode_ensure_writeable(struct super_block *sb, struct inode *inode);
+void ouichefs_inode_init_owner(struct mnt_idmap *idmap, struct inode *inode,
+		      const struct inode *dir, umode_t mode);
 
 /* file functions */
 extern const struct file_operations ouichefs_file_ops;

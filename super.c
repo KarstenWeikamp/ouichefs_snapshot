@@ -61,8 +61,8 @@ static int ouichefs_write_inode(struct inode *inode,
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct buffer_head *bh;
 	uint32_t ino = inode->i_ino;
-	uint32_t inode_block = (ino / OUICHEFS_INODES_PER_BLOCK) + 1;
-	uint32_t inode_shift = ino % OUICHEFS_INODES_PER_BLOCK;
+	uint32_t inode_block = OUICHEFS_INODE_BLOCK(ino);
+	uint32_t inode_shift = OUICHEFS_INODE_SHIFT(ino);
 
 	if (ino >= sbi->nr_inodes)
 		return 0;
@@ -327,7 +327,7 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = PTR_ERR(root_inode);
 		goto free_bfree;
 	}
-	inode_init_owner(&nop_mnt_idmap, root_inode, NULL, root_inode->i_mode);
+	ouichefs_inode_init_owner(&nop_mnt_idmap, root_inode, NULL, root_inode->i_mode);
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root) {
 		ret = -ENOMEM;

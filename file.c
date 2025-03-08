@@ -154,6 +154,8 @@ static int ouichefs_write_begin(struct file *file,
 	int err;
 	uint32_t nr_allocs = 0;
 
+	ouichefs_inode_ensure_writeable(file->f_inode->i_sb, file->f_inode);
+
 	/* Check if the write can be completed (enough space?) */
 	if (pos + len > OUICHEFS_MAX_FILESIZE)
 		return -ENOSPC;
@@ -251,6 +253,8 @@ static int ouichefs_open(struct inode *inode, struct file *file) {
 	bool wronly = (file->f_flags & O_WRONLY) != 0;
 	bool rdwr = (file->f_flags & O_RDWR) != 0;
 	bool trunc = (file->f_flags & O_TRUNC) != 0;
+
+	ouichefs_inode_ensure_writeable(inode->i_sb, inode);
 
 	if ((wronly || rdwr) && trunc && (inode->i_size != 0)) {
 		struct super_block *sb = inode->i_sb;

@@ -11,11 +11,35 @@
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/slab.h>
+#include <linux/dcache.h>
+#include <linux/printk.h>
 
 #include "ouichefs.h"
 #include "bitmap.h"
+#include "snapshot.h"
+
+#define OUICHEFS_INODE_STORE 1
+#define OUICHEFS_INODE_BLOCK(ino) \
+	((ino / OUICHEFS_INODES_PER_BLOCK) + OUICHEFS_INODE_STORE)
+#define OUICHEFS_INODE_SHIFT(ino) \
+	(ino % OUICHEFS_INODES_PER_BLOCK)
 
 static const struct inode_operations ouichefs_inode_ops;
+
+void ouichefs_inode_init_owner(struct mnt_idmap *idmap, struct inode *inode,
+		      const struct inode *dir, umode_t mode)
+{
+	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+
+	inode_init_owner(idmap, inode, dir, mode);
+
+	if (dir == NULL || inode->i_sb != dir->i_sb) {
+		ci->parent = NULL;
+		return;
+	}
+
+	ci->parent = OUICHEFS_INODE(dir);
+}
 
 /*
  * Get inode ino from disk.
@@ -27,8 +51,8 @@ struct inode *ouichefs_iget(struct super_block *sb, unsigned long ino)
 	struct ouichefs_inode_info *ci = NULL;
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct buffer_head *bh = NULL;
-	uint32_t inode_block = (ino / OUICHEFS_INODES_PER_BLOCK) + 1;
-	uint32_t inode_shift = ino % OUICHEFS_INODES_PER_BLOCK;
+	uint32_t inode_block = OUICHEFS_INODE_BLOCK(ino);
+	uint32_t inode_shift = OUICHEFS_INODE_SHIFT(ino);
 	int ret;
 
 	/* Fail if ino is out of range */
@@ -92,6 +116,162 @@ failed:
 	return ERR_PTR(ret);
 }
 
+static int ouichefs_index_replace(struct ouichefs_dir_block *index, long old_ino,
+				  long new_ino)
+{
+	for (int i = 0; i < OUICHEFS_MAX_SUBFILES; i++) {
+		if (le32_to_cpu(index->files[i].inode) == old_ino) {
+			index->files[i].inode = cpu_to_le32(new_ino);
+			return i;
+		}
+	}
+
+	pr_err("Could not find inode #%li to replace it with #%li!\n",
+	       old_ino, new_ino);
+	return -1;
+}
+
+int ouichefs_inode_ensure_writeable(struct super_block *sb, struct inode *inode)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct ouichefs_inode_info *inode_inf;
+	struct buffer_head *bh = NULL;
+	struct ouichefs_dir_block *dblock;
+	long old_ino, old_index, new_index, child_old_ino = 0, child_new_ino = 0;
+	int ret;
+
+	/*
+	 * Any path from a file or directory to the root will be one of
+	 * three things:
+	 *
+	 * - only snapshot inodes, which are read-only,
+	 * - only non-snapshot inodes, or
+	 * - a sequence of snapshot inodes followed by non-snapshot
+	 *   inodes
+	 *
+	 * If the file/directory we want to change is a snapshot inode,
+	 * we need to walk up from the inode until we reach either a
+	 * non-snapshot inode (which we can write without a problem) or
+	 * we reach the root, and for each snapshot inode, create a copy
+	 * which is a non-snapshot inode.
+	 */
+
+	pr_debug("Starting ensure_writeable at inode #%li\n", inode->i_ino);
+
+	dblock = kzalloc(OUICHEFS_BLOCK_SIZE, GFP_KERNEL);
+
+	while (1) {
+		if (inode == NULL) {
+			/* this should NOT happen. */
+			pr_err("Inode is null!\n");
+			return -ENODEV;
+		}
+
+		if (inode->i_sb != sb) {
+			/* we went past the root; we can stop. not an error. */
+			pr_warn("Went past root!\n");
+			break;
+		}
+
+		inode_inf = OUICHEFS_INODE(inode);
+		old_index = inode_inf->index_block;
+
+		/* create a copy of the index block */
+		if (inode->i_ino == 1 || is_inode_snapshot(sb, inode->i_ino) == 0) {
+			/* reaching a non-snapshot inode or the file system root
+			 * means we no longer need to keep iterating, but if we
+			 * have modified some inode previously, we still need to
+			 * update the reference in this inode's index block.
+			 */
+			new_index = old_index;
+		} else {
+			new_index = get_free_block(sbi);
+		}
+
+		if (new_index <= 0) {
+			pr_err("Could not create an index for cow\n");
+			ret = -ENOSPC;
+			break;
+		}
+
+		bh = sb_bread(sb, inode_inf->index_block);
+		if (!bh) {
+			pr_err("Could not read old index block.\n");
+			ret = -EIO;
+			break;
+		}
+
+		memcpy(dblock, bh->b_data, OUICHEFS_BLOCK_SIZE);
+		brelse(bh);
+
+		/* set the inode number of the child, which we
+		 * previously changed, properly
+		 */
+		if (child_old_ino != 0)
+			ret = ouichefs_index_replace(dblock, child_old_ino, child_new_ino);
+		else
+			ret = 0;
+
+		if (ret < 0) {
+			pr_err("Something went wrong while replacing index.\n");
+			break;
+		}
+
+		ret = write_inode_now(inode, 1);
+		if (ret != 0) {
+			pr_err("Unable to write inode!\n");
+			break;
+		}
+
+		/* transfer content to new index block */
+		bh = sb_bread(sb, new_index);
+		if (!bh) {
+			pr_err("Could not write new index block.\n");
+			ret = -EIO;
+			break;
+		}
+
+		memcpy(bh->b_data, dblock, OUICHEFS_BLOCK_SIZE);
+
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+
+		brelse(bh);
+
+		if (inode->i_ino == 1 || is_inode_snapshot(sb, inode->i_ino) == 0) {
+			ret = 0;
+			break;
+		}
+
+		/* if we are here, we are still in ouichefs and the current
+		 * inode is a snapshot inode which is not the root
+		 */
+
+		inode_inf->index_block = new_index;
+		old_ino = inode->i_ino;
+		inode->i_ino = get_free_inode(sbi);
+
+		mark_inode_dirty(inode);
+
+		/* make inode writeable. needs to happen after the
+		 * previous check.
+		 */
+		unset_inode_snapshot_bit(sb, inode->i_ino);
+
+		/* use writeable disk inode in ram inode */
+		child_old_ino = old_ino;
+		child_new_ino = inode->i_ino;
+
+		/* iterate upwards in the file tree */
+		inode_inf = inode_inf->parent;
+		inode = &(inode_inf->vfs_inode);
+	}
+
+	kfree(dblock);
+
+	return 0;
+}
+
 /*
  * Look for dentry in dir.
  * Fill dentry with NULL if not in dir, with the corresponding inode if found.
@@ -126,6 +306,9 @@ static struct dentry *ouichefs_lookup(struct inode *dir, struct dentry *dentry,
 		if (!strncmp(f->filename, dentry->d_name.name,
 			     OUICHEFS_FILENAME_LEN)) {
 			inode = ouichefs_iget(sb, f->inode);
+			if (!(inode->i_state & I_NEW))
+				ouichefs_inode_init_owner(&nop_mnt_idmap, inode, dir,
+							  inode->i_mode);
 			break;
 		}
 	}
@@ -185,7 +368,7 @@ static struct inode *ouichefs_new_inode(struct inode *dir, mode_t mode)
 	ci->index_block = bno;
 
 	/* Initialize inode */
-	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+	ouichefs_inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
 	inode->i_blocks = 1;
 	if (S_ISDIR(mode)) {
 		inode->i_size = OUICHEFS_BLOCK_SIZE;
@@ -235,6 +418,10 @@ static int ouichefs_create(struct mnt_idmap *idmap, struct inode *dir,
 	/* Read parent directory index */
 	ci_dir = OUICHEFS_INODE(dir);
 	sb = dir->i_sb;
+
+	/* ensure directory inode is not a snapshot inode */
+	ouichefs_inode_ensure_writeable(sb, dir);
+
 	bh = sb_bread(sb, ci_dir->index_block);
 	if (!bh)
 		return -EIO;
@@ -319,6 +506,9 @@ static int ouichefs_unlink(struct inode *dir, struct dentry *dentry)
 	ino = inode->i_ino;
 	bno = OUICHEFS_INODE(inode)->index_block;
 
+	/* ensure directory inode is not a snapshot inode */
+	ouichefs_inode_ensure_writeable(sb, dir);
+
 	/* Read parent directory index */
 	bh = sb_bread(sb, OUICHEFS_INODE(dir)->index_block);
 	if (!bh)
@@ -347,6 +537,22 @@ static int ouichefs_unlink(struct inode *dir, struct dentry *dentry)
 	if (S_ISDIR(inode->i_mode))
 		inode_dec_link_count(dir);
 	mark_inode_dirty(dir);
+
+	/* do not delete inodes that are part of a snapshot */
+	if (is_inode_snapshot(sb, inode->i_ino)) {
+		/* preserve snapshot state if it is dirty */
+		write_inode_now(inode, 1);
+
+		/*
+		 * delete the vfs inode. make sure to change the inode number to
+		 * avoid overwriting.
+		 */
+		clear_nlink(inode);
+		inode->i_ino = 0;
+		mark_inode_dirty(inode);
+
+		return 0;
+	}
 
 	/*
 	 * Cleanup pointed blocks if unlinking a file. If we fail to read the
@@ -396,6 +602,8 @@ clean_inode:
 		0;
 	inode_dec_link_count(inode);
 	mark_inode_dirty(inode);
+	/* Overwrite the old inode with 0s */
+	write_inode_now(inode, 1);
 
 	/* Free inode and index block from bitmap */
 	put_block(sbi, bno);
@@ -423,6 +631,9 @@ static int ouichefs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	/* Check if filename is not too long */
 	if (strlen(new_dentry->d_name.name) > OUICHEFS_FILENAME_LEN)
 		return -ENAMETOOLONG;
+
+	ouichefs_inode_ensure_writeable(sb, old_dir);
+	ouichefs_inode_ensure_writeable(sb, new_dir);
 
 	/* Fail if new_dentry exists or if new_dir is full */
 	bh_new = sb_bread(sb, ci_new->index_block);
@@ -514,6 +725,9 @@ relse_new:
 static int ouichefs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, umode_t mode)
 {
+	/* ensure directory inode is not a snapshot inode */
+	ouichefs_inode_ensure_writeable(dir->i_sb, dir);
+
 	return ouichefs_create(NULL, dir, dentry, mode | S_IFDIR, 0);
 }
 
@@ -527,6 +741,10 @@ static int ouichefs_rmdir(struct inode *dir, struct dentry *dentry)
 	/* If the directory is not empty, fail */
 	if (inode->i_nlink > 2)
 		return -ENOTEMPTY;
+
+	/* ensure directory inode is not a snapshot inode */
+	ouichefs_inode_ensure_writeable(sb, dir);
+
 	bh = sb_bread(sb, OUICHEFS_INODE(inode)->index_block);
 	if (!bh)
 		return -EIO;
