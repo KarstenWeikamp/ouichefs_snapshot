@@ -6,6 +6,7 @@
 *.ko
 *.obj
 *.elf
+*.bin
 
 # Linker output
 *.ilk
@@ -53,4 +54,18 @@ Mkfile.old
 dkms.conf
 
 # Other
+*.img
+*.log
+build/
+.*
+
+# Editor-related
+compile_commands.json
+.clangd
+
 mkfs/test.img
+compile_commands.json
+.vscode/
+*.code-
+mkfs/ouichefs.code-workspace
+.cache/
