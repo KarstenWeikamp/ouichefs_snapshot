@@ -5,9 +5,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
-#include <errno.h>
 #include <endian.h>
 #include <string.h>
+#include <assert.h>
 
 #define OUICHEFS_MAGIC 0x48434957
 
@@ -50,8 +50,18 @@ struct ouichefs_superblock {
 	uint32_t nr_free_inodes; /* Number of free inodes */
 	uint32_t nr_free_blocks; /* Number of free blocks */
 
-	char padding[4064]; /* Padding to match block size */
+	uint32_t nr_isnap_blocks; /* Number of snapshot inodes bitmask blocks */
+	uint32_t nr_bsnap_blocks; /* Number of snapshot blocks bitmask blocks */
+
+	uint32_t latest_snapshot; /* ID of the latest created or restored snapshot */
+
+	char padding[4052]; /* Padding to match block size */
 };
+
+static_assert(
+	sizeof(struct ouichefs_superblock) == OUICHEFS_BLOCK_SIZE,
+	"Superblock size must be exactly one block."
+);
 
 struct ouichefs_file_index_block {
 	uint32_t blocks[OUICHEFS_BLOCK_SIZE >> 2];
@@ -85,8 +95,8 @@ static struct ouichefs_superblock *write_superblock(int fd, struct stat *fstats)
 {
 	int ret;
 	struct ouichefs_superblock *sb;
-	uint32_t nr_inodes = 0, nr_blocks = 0, nr_ifree_blocks = 0;
-	uint32_t nr_bfree_blocks = 0, nr_data_blocks = 0, nr_istore_blocks = 0;
+	uint32_t nr_inodes = 0, nr_blocks = 0, nr_ibitmaps_blocks = 0;
+	uint32_t nr_bbitmaps_blocks = 0, nr_data_blocks = 0, nr_istore_blocks = 0;
 	uint32_t mod;
 
 	sb = malloc(sizeof(struct ouichefs_superblock));
@@ -99,20 +109,22 @@ static struct ouichefs_superblock *write_superblock(int fd, struct stat *fstats)
 	if (mod != 0)
 		nr_inodes += mod;
 	nr_istore_blocks = idiv_ceil(nr_inodes, OUICHEFS_INODES_PER_BLOCK);
-	nr_ifree_blocks = idiv_ceil(nr_inodes, OUICHEFS_BLOCK_SIZE * 8);
-	nr_bfree_blocks = idiv_ceil(nr_blocks, OUICHEFS_BLOCK_SIZE * 8);
-	nr_data_blocks = nr_blocks - 1 - nr_istore_blocks - nr_ifree_blocks -
-			 nr_bfree_blocks;
+	nr_ibitmaps_blocks = idiv_ceil(nr_inodes, OUICHEFS_BLOCK_SIZE * 8);
+	nr_bbitmaps_blocks = idiv_ceil(nr_blocks, OUICHEFS_BLOCK_SIZE * 8);
+	nr_data_blocks = nr_blocks - 1 - nr_istore_blocks -
+			(2 * nr_ibitmaps_blocks) - nr_bbitmaps_blocks;
 
 	memset(sb, 0, sizeof(struct ouichefs_superblock));
 	sb->magic = htole32(OUICHEFS_MAGIC);
 	sb->nr_blocks = htole32(nr_blocks);
 	sb->nr_inodes = htole32(nr_inodes);
 	sb->nr_istore_blocks = htole32(nr_istore_blocks);
-	sb->nr_ifree_blocks = htole32(nr_ifree_blocks);
-	sb->nr_bfree_blocks = htole32(nr_bfree_blocks);
+	sb->nr_ifree_blocks = htole32(nr_ibitmaps_blocks);
+	sb->nr_bfree_blocks = htole32(nr_bbitmaps_blocks);
 	sb->nr_free_inodes = htole32(nr_inodes - 1);
 	sb->nr_free_blocks = htole32(nr_data_blocks - 1);
+	sb->nr_isnap_blocks = htole32(nr_ibitmaps_blocks);
+	sb->nr_bsnap_blocks = htole32(nr_bbitmaps_blocks);
 
 	ret = write(fd, sb, sizeof(struct ouichefs_superblock));
 	if (ret != sizeof(struct ouichefs_superblock)) {
@@ -127,10 +139,13 @@ static struct ouichefs_superblock *write_superblock(int fd, struct stat *fstats)
 	       "\tnr_ifree_blocks=%u\n"
 	       "\tnr_bfree_blocks=%u\n"
 	       "\tnr_free_inodes=%u\n"
-	       "\tnr_free_blocks=%u\n",
+	       "\tnr_free_blocks=%u\n"
+	       "\tnr_isnap_blocks=%u\n"
+	       "\tnr_bsnap_blocks=%u\n",
 	       sizeof(struct ouichefs_superblock), sb->magic, sb->nr_blocks,
 	       sb->nr_inodes, sb->nr_istore_blocks, sb->nr_ifree_blocks,
-	       sb->nr_bfree_blocks, sb->nr_free_inodes, sb->nr_free_blocks);
+	       sb->nr_bfree_blocks, sb->nr_free_inodes, sb->nr_free_blocks,
+	       sb->nr_isnap_blocks, sb->nr_bsnap_blocks);
 
 	return sb;
 }
@@ -153,6 +168,8 @@ static int write_inode_store(int fd, struct ouichefs_superblock *sb)
 	inode = (struct ouichefs_inode *)block + 1;
 	first_data_block = 1 + le32toh(sb->nr_bfree_blocks) +
 			   le32toh(sb->nr_ifree_blocks) +
+			   le32toh(sb->nr_isnap_blocks) +
+			   le32toh(sb->nr_bsnap_blocks) +
 			   le32toh(sb->nr_istore_blocks);
 	inode->i_mode =
 		htole32(S_IFDIR | S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR |
@@ -242,7 +259,9 @@ static int write_bfree_blocks(int fd, struct ouichefs_superblock *sb)
 	uint64_t *bfree, mask, line;
 	uint32_t nr_used = le32toh(sb->nr_istore_blocks) +
 			   le32toh(sb->nr_ifree_blocks) +
-			   le32toh(sb->nr_bfree_blocks) + 2;
+			   le32toh(sb->nr_isnap_blocks) +
+			   le32toh(sb->nr_bfree_blocks) +
+			   le32toh(sb->nr_bsnap_blocks) + 2;
 
 	block = malloc(OUICHEFS_BLOCK_SIZE);
 	if (!block)
@@ -284,6 +303,68 @@ static int write_bfree_blocks(int fd, struct ouichefs_superblock *sb)
 	ret = 0;
 
 	printf("Bfree blocks: wrote %d blocks\n", i);
+end:
+	free(block);
+
+	return ret;
+}
+
+static int write_bsnap_blocks(int fd, struct ouichefs_superblock *sb)
+{
+	int ret = 0;
+	uint32_t i;
+	char *block;
+
+	block = malloc(OUICHEFS_BLOCK_SIZE);
+	if (!block)
+		return -1;
+
+	/* Set all bits to 0 */
+	memset(block, 0, OUICHEFS_BLOCK_SIZE);
+
+	/* All bsnap blocks */
+	for (i = 0; i < le32toh(sb->nr_bsnap_blocks); i++) {
+		ret = write(fd, block, OUICHEFS_BLOCK_SIZE);
+		if (ret != OUICHEFS_BLOCK_SIZE) {
+			ret = -1;
+			goto end;
+		}
+	}
+	ret = 0;
+
+	printf("Bsnap blocks: wrote %d blocks\n", i);
+
+end:
+	free(block);
+
+	return ret;
+}
+
+static int write_isnap_blocks(int fd, struct ouichefs_superblock *sb)
+{
+	int ret = 0;
+	uint32_t i;
+	char *block;
+
+	block = malloc(OUICHEFS_BLOCK_SIZE);
+	if (!block)
+		return -1;
+
+	/* Set all bits to 0 */
+	memset(block, 0, OUICHEFS_BLOCK_SIZE);
+
+	/* All isnap blocks */
+	for (i = 0; i < le32toh(sb->nr_isnap_blocks); i++) {
+		ret = write(fd, block, OUICHEFS_BLOCK_SIZE);
+		if (ret != OUICHEFS_BLOCK_SIZE) {
+			ret = -1;
+			goto end;
+		}
+	}
+	ret = 0;
+
+	printf("Isnap blocks: wrote %d blocks\n", i);
+
 end:
 	free(block);
 
@@ -395,10 +476,26 @@ int main(int argc, char **argv)
 		goto free_sb;
 	}
 
+	/* Write inode snapshot bitmap blocks */
+	ret = write_isnap_blocks(fd, sb);
+	if (ret != 0) {
+		perror("write_isnap_blocks()");
+		ret = EXIT_FAILURE;
+		goto free_sb;
+	}
+
 	/* Write block free bitmap blocks */
 	ret = write_bfree_blocks(fd, sb);
 	if (ret != 0) {
 		perror("write_bfree_blocks()");
+		ret = EXIT_FAILURE;
+		goto free_sb;
+	}
+
+	/* Write block snap bitmap blocks */
+	ret = write_bsnap_blocks(fd, sb);
+	if (ret != 0) {
+		perror("write_bsnap_blocks()");
 		ret = EXIT_FAILURE;
 		goto free_sb;
 	}
