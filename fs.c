@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 
 #include "ouichefs.h"
+#include "sysfs.h"
 
 /*
  * Mount a ouiche_fs partition
@@ -37,7 +38,7 @@ struct dentry *ouichefs_mount(struct file_system_type *fs_type, int flags,
 void ouichefs_kill_sb(struct super_block *sb)
 {
 	kill_block_super(sb);
-
+	delete_ouichefs_partition_snapshot_controls(sb->s_id);
 	pr_info("unmounted disk\n");
 }
 
@@ -65,10 +66,16 @@ static int __init ouichefs_init(void)
 		pr_err("register_filesystem() failed\n");
 		goto err_inode;
 	}
-
+	ret = init_sysfs();
+	if (ret) {
+		pr_err("init_sysfs() failed\n");
+		goto err_sysfs;
+	}
 	pr_info("module loaded\n");
 	return 0;
 
+err_sysfs:
+	unregister_filesystem(&ouichefs_file_system_type);
 err_inode:
 	ouichefs_destroy_inode_cache();
 err:
@@ -84,6 +91,8 @@ static void __exit ouichefs_exit(void)
 		pr_err("unregister_filesystem() failed\n");
 
 	ouichefs_destroy_inode_cache();
+
+	deinit_sysfs();
 
 	pr_info("module unloaded\n");
 }

@@ -14,6 +14,7 @@
 #include <linux/statfs.h>
 
 #include "ouichefs.h"
+#include "sysfs.h"
 
 static struct kmem_cache *ouichefs_inode_cache;
 
@@ -333,6 +334,8 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = -ENOMEM;
 		goto iput;
 	}
+
+	create_ouichefs_partition_snapshot_controls(sb);
 
 	return 0;
 
