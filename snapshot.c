@@ -309,6 +309,277 @@ put_block:
 }
 
 /**
+ * scrub_index_block - Scrubs an index block by zeroing its contents.
+ * @sb: Pointer to the super_block structure.
+ * @bno: Block number to be scrubbed.
+ *
+ * Return: 0 on success, -EINVAL if the block number is invalid, or -EIO if
+ *         the block could not be read.
+ */
+
+static inline int scrub_index_block(struct super_block *sb, uint32_t bno)
+{
+	int retval = 0;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+
+	if (bno == 0 && !test_bit(bno, sbi->bfree_bitmap)) {
+		pr_err("Invalid block number #%u for scrubbing. Block is either free or 0\n",
+		       bno);
+		return -EINVAL;
+	}
+	struct buffer_head *bh = sb_bread(sb, bno);
+
+	if (bh) {
+		memset(bh->b_data, 0, OUICHEFS_BLOCK_SIZE);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+	} else {
+		pr_err("Failed to read block #%u for scrubbing.\n", bno);
+		retval = -EIO;
+	}
+	brelse(bh);
+	return retval;
+}
+
+static int inode_subfile_bitmap_operation(
+	struct super_block *sb, struct inode *sub_inode, unsigned long *bitmap,
+	void(bitmap_op)(unsigned long *, unsigned int, unsigned int))
+{
+	if (OUICHEFS_INODE(sub_inode)->index_block == 0) {
+		pr_err("Invalid index block\n");
+		return -EINVAL;
+	}
+	struct buffer_head *bh =
+		sb_bread(sb, OUICHEFS_INODE(sub_inode)->index_block);
+
+	if (!bh) {
+		pr_err("Failed to read block %u\n",
+		       OUICHEFS_INODE(sub_inode)->index_block);
+		return -EIO;
+	}
+	struct ouichefs_file_index_block *fblock =
+		(struct ouichefs_file_index_block *)bh->b_data;
+	for (int i = 0; i < OUICHEFS_FILE_MAX_SUBBLOCKS; i++) {
+		if (fblock->blocks[i] == 0)
+			continue;
+		bitmap_op(bitmap, fblock->blocks[i], 1);
+	}
+	brelse(bh);
+	return 0;
+}
+
+static int scrub_inode(struct super_block *sb, uint64_t delete_ino)
+{
+	struct inode *inode = ouichefs_iget(sb, delete_ino);
+
+	if (!inode) {
+		pr_err("Failed to get inode #%llu for scrubbing.\n",
+		       delete_ino);
+		return -EIO;
+	}
+
+	inode_lock(inode);
+
+	uint32_t bno = OUICHEFS_INODE(inode)->index_block;
+	// Scrub its index block
+	scrub_index_block(sb, bno);
+
+	inode->i_blocks = 0;
+	OUICHEFS_INODE(inode)->index_block = 0;
+	inode->i_size = 0;
+	i_uid_write(inode, 0);
+	i_gid_write(inode, 0);
+	inode->i_mode = 0;
+	inode->i_ctime.tv_sec = inode->i_mtime.tv_sec = inode->i_atime.tv_sec =
+		0;
+	inode->i_ctime.tv_nsec = inode->i_mtime.tv_nsec =
+		inode->i_atime.tv_nsec = 0;
+	inode_dec_link_count(inode);
+	mark_inode_dirty(inode);
+	inode_unlock(inode);
+	iput(inode);
+
+	put_inode(OUICHEFS_SB(sb), delete_ino);
+	put_block(OUICHEFS_SB(sb), bno);
+
+	return 0;
+}
+
+/**
+ * walk_tree_build_bitmaps - Traverse directory tree and perform operations on bitmaps.
+ * @sb: Pointer to the super block structure.
+ * @dblock: Pointer to the directory block structure.
+ * @inode_bmap: Bitmap of inodes.
+ * @block_bmap: Bitmap of blocks.
+ * @bitmap_op: function pointer to set what bitmap function should be performed on both bitmaps.
+ *
+ * This function traverses the directory tree starting from the given
+ * directory block and builds bitmaps for inodes and blocks
+ *
+ * @return: 0 on success.
+ */
+static int walk_tree_build_bitmaps(
+	struct super_block *sb, struct ouichefs_dir_block *dblock,
+	unsigned long *inode_bmap, unsigned long *block_bmap,
+	void(bitmap_op)(unsigned long *, unsigned int, unsigned int))
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	unsigned long *inode_walk_bmap =
+		bitmap_zalloc(sbi->nr_inodes, GFP_KERNEL);
+
+	LIST_HEAD(inode_list);
+
+	struct inode_entry {
+		uint32_t ino;
+		struct list_head list;
+	};
+
+	int retval = 0;
+
+	while (1) {
+		for (int i = 0; i < OUICHEFS_MAX_SUBFILES; i++) {
+			if (dblock->files[i].inode == 0)
+				break;
+			if (test_bit(dblock->files[i].inode, inode_walk_bmap))
+				continue; //inode already in covered
+			bitmap_op(inode_bmap, dblock->files[i].inode, 1);
+			struct inode *sub_inode =
+				ouichefs_iget(sb, dblock->files[i].inode);
+
+			if (OUICHEFS_INODE(sub_inode)->index_block == 0) {
+				pr_err("INDEX NODE %lu has index block 0",
+				       sub_inode->i_ino);
+				iput(sub_inode);
+				continue;
+			}
+			if (S_ISDIR(sub_inode->i_mode)) {
+				struct inode_entry *entry =
+					kmalloc(sizeof(*entry), GFP_KERNEL);
+				entry->ino = sub_inode->i_ino;
+				list_add_tail(&entry->list, &inode_list);
+			} else if (S_ISREG(sub_inode->i_mode)) {
+				inode_subfile_bitmap_operation(
+					sb, sub_inode, block_bmap, bitmap_op);
+			}
+			iput(sub_inode);
+		}
+		//get first inode from worklist
+		//If worklist is empty, were done
+		if (list_empty(&inode_list))
+			break;
+
+		struct inode_entry *entry =
+			list_first_entry(&inode_list, struct inode_entry, list);
+
+		struct inode *next_inode = ouichefs_iget(sb, entry->ino);
+
+		list_del(&entry->list);
+		kfree(entry);
+
+		retval = ouichefs_get_dir_block_from_disk(
+			sb, OUICHEFS_INODE(next_inode)->index_block, dblock);
+		iput(next_inode);
+	}
+
+	bitmap_free(inode_walk_bmap);
+	return 0;
+}
+
+/**
+ * ouichefs_scrub_snapshot- Scrub all inodes that are only referenced by the snapshot
+ * that is going to be deleted.
+ *
+ * @param sb Superblock of the partition
+ * @param snap snapshot to be scrubbed
+ *
+ * @return Returns 0 on success, or a negative error code otherwise
+ */
+static int ouichefs_scrub_snapshot(struct super_block *sb, struct ouichefs_snapshot *snap)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct ouichefs_dir_block *dblock =
+		kmalloc(sizeof(struct ouichefs_dir_block), GFP_KERNEL);
+
+	// Get the snapshot directory block
+	int retval = ouichefs_get_dir_block_from_disk(sb, snap->bno, dblock);
+
+	if (retval) {
+		kfree(dblock);
+		return -EIO;
+	}
+
+	//Mark all inodes in this bitmap that shall be deleted
+	unsigned long *to_delete_inode_bmap =
+		bitmap_zalloc(sbi->nr_inodes, GFP_KERNEL);
+
+	//Bitmap of all extra block of file inodes that shall be deleted
+	unsigned long *to_delete_block_bmap =
+		bitmap_zalloc(sbi->nr_blocks, GFP_KERNEL);
+
+	/* First we walk over the to be deleted snapshot.
+	 * Set all inodes and blocks of file inodes in the bitmaps are contained
+	 * in this snapshot.
+	 */
+	walk_tree_build_bitmaps(sb, dblock, to_delete_inode_bmap,
+				to_delete_block_bmap, bitmap_set);
+
+	/* Invalidate the snapshot list entry */
+	put_block(sbi, snap->bno);
+	memset(snap, 0, sizeof(*snap));
+
+	/* Now we walk over all other snapshots,
+	 * remove all inodes and blocks that are in other snapshots from the
+	 * bitmaps.
+	 */
+	while ((snap = ouichefs_snap_next(sb, snap)) != NULL) {
+		int retval =
+			ouichefs_get_dir_block_from_disk(sb, snap->bno, dblock);
+
+		if (retval) {
+			retval = -EIO;
+			goto cleanup;
+		}
+
+		walk_tree_build_bitmaps(sb, dblock, to_delete_inode_bmap,
+					to_delete_block_bmap, bitmap_clear);
+	}
+	// Now scrub all inodes left in the bitmap.
+	while (1) {
+		uint64_t delete_ino =
+			find_first_bit(to_delete_inode_bmap, sbi->nr_inodes);
+		if (delete_ino == sbi->nr_inodes)
+			break;
+		bitmap_clear(to_delete_inode_bmap, delete_ino, 1);
+		scrub_inode(sb, delete_ino);
+	}
+
+	// Scrub all the blocks on the block bitmap
+	while (1) {
+		uint32_t delete_bno =
+			find_first_bit(to_delete_block_bmap, sbi->nr_blocks);
+		if (delete_bno == sbi->nr_blocks)
+			break;
+		bitmap_clear(to_delete_block_bmap, delete_bno, 1);
+
+		//scrub block
+		scrub_index_block(sb, delete_bno);
+		put_block(sbi, delete_bno);
+	}
+
+cleanup:
+	//Clean up all allocated resources
+	bitmap_free(to_delete_inode_bmap);
+	bitmap_free(to_delete_block_bmap);
+	kfree(dblock);
+
+	// Clear caches
+	shrink_dcache_parent(sb->s_root);
+	evict_inodes(sb);
+
+	return retval;
+}
+
+/**
  * ouichefs_snap_destroy - Destroy a snapshot
  *
  * @param sb Superblock of partition on which to delete a snapshot
@@ -336,7 +607,7 @@ int ouichefs_snap_destroy(struct super_block *sb, int snap_id)
 		return -EINVAL;
 	}
 
-	put_block(sbi, snap->bno);
+	freeze_super(sb);
 
 	/* remove this snapshots ID from any other snapshots parent_id */
 	while ((temp = ouichefs_snap_next(sb, temp)) != NULL) {
@@ -344,11 +615,9 @@ int ouichefs_snap_destroy(struct super_block *sb, int snap_id)
 			temp->parent_id = snap->parent_id;
 	}
 
-	/* Invalidate the snapshot list entry */
-	memset(snap, 0, sizeof(*snap));
+	ouichefs_scrub_snapshot(sb, snap);
 
-	pr_info("Partition %s: Destroyed snapshot #%i\n",
-		sb->s_id, snap_id);
+	thaw_super(sb);
 
 	return 0;
 }
